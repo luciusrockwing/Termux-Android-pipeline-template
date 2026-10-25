@@ -1,0 +1,13 @@
+# Upstream is cloned into $HOME/build-<project> inside the container and this
+# repo is never built in place, but a local test run or a forgotten `git add -A`
+# can still sweep a multi-gigabyte target/ into a commit.
+target/
+build-*/
+
+# Pipeline scratch
+out/
+dist/
+*.deb
+
+__pycache__/
+*.pyc

@@ -1,0 +1,284 @@
+---
+name: release-android
+
+# Builds the upstream project for Termux (aarch64-linux-android) and publishes
+# it as a .deb.
+#
+# Everything project-specific lives in pipeline.json. This workflow reads the
+# project name, version, upstream repo and artifact naming from there, so
+# adopting it on a new fork should not require editing this file at all.
+#
+# Why a container: the runner is aarch64 Linux, not Termux. Termux packages are
+# built against a patched Bionic sysroot with Android's bionic at $PREFIX, and
+# the only ready-made way to get that is termux-docker:aarch64. Inside it the
+# host triple is already aarch64-linux-android, so there is no NDK and no
+# cross-linker.
+#
+# There is no upstream watcher on purpose. Upstream ships prereleases often, so
+# an automated poller would burn a full ARM build on every alpha. Bump
+# pipeline.json and dispatch by hand.
+
+"on":
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (blank = the pin in pipeline.json)"
+        required: false
+        type: string
+      upstream_ref:
+        description: >-
+          Upstream branch or commit instead of the pinned ref (dev build)
+        required: false
+        type: string
+      draft:
+        description: "Create the release as a draft"
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark the release as a prerelease (ignored for drafts)"
+        required: false
+        default: true
+        type: boolean
+  workflow_call:
+    inputs:
+      version:
+        required: false
+        type: string
+      upstream_ref:
+        required: false
+        type: string
+      draft:
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-android
+  cancel-in-progress: false
+
+jobs:
+  # Cheap preflight on a standard x64 runner. A typo in pipeline.json is the
+  # single most common failure, and catching it here saves a ~16 minute ARM
+  # build plus a container image pull.
+  lint:
+    name: validate config and scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Validate pipeline.json
+        run: python3 termux/ci/pipeline_config.py show
+
+      - name: Test the config engine
+        run: python3 termux/ci/test_pipeline_config.py
+
+      - name: Syntax-check every script
+        run: |
+          set -euo pipefail
+          for script in termux/ci/*.sh install.sh; do
+            echo "bash -n $script"
+            bash -n "$script"
+          done
+
+      - name: Check for shellcheck findings
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC1091: /out/build-env.sh is created at runtime by
+          # build-on-runner.sh.
+          shellcheck -S warning -e SC1091 termux/ci/*.sh install.sh
+
+  build:
+    name: build (aarch64-linux-android)
+    needs: lint
+    # ARM64 hosted runners are free for public repositories.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      project: ${{ steps.resolve.outputs.project }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Resolve release coordinates
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          PROJECT="$(python3 -c \
+            "import json;print(json.load(open('pipeline.json'))['project'])")"
+          PINNED="$(python3 -c \
+            "import json;print(json.load(open('pipeline.json'))['version'])")"
+          VERSION="${INPUT_VERSION:-$PINNED}"
+          VERSION="${VERSION#v}"
+
+          if [ -n "$INPUT_UPSTREAM_REF" ]; then
+            # A build from a branch/commit has no upstream tag of its own, so
+            # derive a distinct tag from the run number to avoid collisions.
+            TAG="v${VERSION}-termux.${GITHUB_RUN_NUMBER}"
+            echo "dev build from ${INPUT_UPSTREAM_REF} -> $TAG"
+          else
+            TAG="v$VERSION"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite an existing release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            >/dev/null 2>&1; then
+            echo "error: release $TAG already exists;" \
+              "bump pipeline.json or change the version input" >&2
+            exit 1
+          fi
+
+      - name: Build in Termux container
+        id: build
+        env:
+          PIPELINE_VERSION: ${{ steps.resolve.outputs.version }}
+          PIPELINE_UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          # build-on-runner.sh echoes OUT_HOST last so this survives the
+          # container's build chatter on the same stream.
+          bash termux/ci/build-on-runner.sh | tail -n1 > "$RUNNER_TEMP/out-host"
+          OUT_HOST="$(cat "$RUNNER_TEMP/out-host")"
+          echo "out_host=$OUT_HOST" >> "$GITHUB_OUTPUT"
+          ls -la "$OUT_HOST" "$OUT_HOST/bin"
+
+      - name: Package .deb
+        env:
+          PIPELINE_VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          OUT_HOST="${{ steps.build.outputs.out_host }}"
+          mkdir -p dist
+          bash termux/ci/package-deb.sh "$OUT_HOST" dist
+          echo "--- BUILD_INFO ---"
+          cat dist/BUILD_INFO
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.resolve.outputs.project }}-android
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PROJECT: ${{ needs.build.outputs.project }}
+      VERSION: ${{ needs.build.outputs.version }}
+      TAG: ${{ needs.build.outputs.tag }}
+
+    steps:
+      # Checkout only so the Publish step can read pipeline.json for the
+      # upstream repo URL. No source is used from it.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.project }}-android
+          path: dist
+
+      - name: Verify checksums
+        run: cd dist && sha256sum -c SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          cd dist
+
+          # Carry upstream's release notes when the pinned ref has them, so the
+          # Termux release does not read as an unexplained empty changelog.
+          UPSTREAM="$(python3 -c \
+            "import json; print(json.load(open('pipeline.json'))['upstream'])" \
+            2>/dev/null || true)"
+          NOTES="$(mktemp)"
+          if [ -n "$UPSTREAM" ]; then
+            REPO="${UPSTREAM#https://}"
+            REPO="${REPO%.git}"
+            gh release view "v$VERSION" --repo "$REPO" \
+              --json body --jq .body > "$NOTES" 2>/dev/null || true
+          fi
+          {
+            echo "Termux (aarch64-linux-android) build of $PROJECT."
+            echo
+            echo "Built in termux-docker from the upstream tree plus" \
+              "the patches in termux/patches/."
+            echo "See BUILD_INFO for the exact commit and toolchain."
+            echo
+            echo "Install with:"
+            printf '  curl -fsSL %s/HEAD/install.sh | bash\n' \
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY"
+            echo
+            if [ -s "$NOTES" ]; then
+              echo "## Upstream v$VERSION"
+              echo
+              cat "$NOTES"
+            fi
+          } > NOTES.md
+
+          # Glob explicitly: an unmatched pattern passes through literally
+          # under `set -e`, which would create a release pointing at nothing.
+          DEBS=( ./*.deb )
+          [ -e "${DEBS[0]}" ] || {
+            echo "error: no .deb found in dist/" >&2
+            exit 1
+          }
+
+          ARGS=(--title "$TAG" --notes-file NOTES.md)
+          # `set -e` makes a false `[ ... ] && ...` the last command of the
+          # script exit non-zero, so these are if-blocks, not one-liners.
+          if [ "$DRAFT" = "true" ]; then
+            ARGS+=(--draft)
+          elif [ "$PRERELEASE" = "true" ]; then
+            ARGS+=(--prerelease)
+          fi
+
+          gh release create "$TAG" "${DEBS[@]}" \
+            SHA256SUMS BUILD_INFO "${ARGS[@]}" \
+            --repo "$GITHUB_REPOSITORY"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY"
+
+      - name: Attach the config used for this build
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp pipeline.json "dist/$TAG-pipeline.json" 2>/dev/null || true
+          gh release upload "$TAG" "dist/$TAG-pipeline.json" \
+            --repo "$GITHUB_REPOSITORY" --clobber 2>/dev/null || true

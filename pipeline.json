@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "STARTER CONFIG: replace every identity, upstream, and build value before use.",
+    "OWNER/REPO and example are placeholders, not buildable targets.",
+    "Run python3 termux/ci/pipeline_config.py validate after editing.",
+    "Run python3 termux/ci/pipeline_config.py show to inspect resolved values.",
+    "Set license to the target project's identifier before building a package."
+  ],
+
+  "project": "example",
+  "version": "0.1.0",
+  "description": "Example project packaged for Termux",
+  "homepage": "https://github.com/OWNER/REPO",
+  "maintainer": "maintainers <maintainers@users.noreply.github.com>",
+
+  "upstream": "https://github.com/OWNER/REPO.git",
+  "upstreamRef": "v0.1.0",
+  "upstreamCommit": "",
+
+  "language": "rust",
+  "profile": "release",
+
+  "binaries": [
+    { "name": "example", "path": "target/{{profile}}/example" }
+  ],
+
+  "preBuildCommands": [],
+  "buildCommands": [
+    "cargo build --locked --profile {{profile}} --bin example"
+  ],
+  "buildEnv": {},
+  "smokeTest": [
+    "{{binary}} --version"
+  ],
+  "elfCheck": true,
+  "debDescriptionExtra": [
+    "Built for Termux on aarch64-linux-android."
+  ]
+}
